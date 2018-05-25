@@ -1,0 +1,8 @@
+#require "digestif.ocaml"
+#require "logs.top"
+#require "fmt.top"
+#require "ptime.clock.os.top"
+#require "rresult.top"
+open Rresult;;
+#require "bencode"
+#mod_use "lib/omgtorrent.ml"

@@ -1,0 +1,35 @@
+opam-version: "1.2"
+maintainer: "root@localhost"
+authors: [ "none" ]
+license: "gopher://license.to.kill"
+homepage: "https://github.com/cfcs/omktorrent"
+dev-repo: "https://github.com/cfcs/omktorrent.git"
+bug-reports: "https://github.com/cfcs/ocaml-omktorrent/issues"
+
+available: [ ocaml-version >= "4.04.2" & os != "windows" ]
+
+build: [
+  [ "ocaml" "pkg/pkg.ml" "build" "--dev-pkg" "%{pinned}%" "--tests" "false"
+    "--with-cli" "%{cmdliner+bos+fpath:installed}%" ]
+]
+build-test: [
+  [ "ocaml" "pkg/pkg.ml" "build" "--dev-pkg" "%{pinned}%" "--tests" "true"
+    "--with-cli" "%{cmdliner+bos+fpath:installed}%" ]
+  [ "ocaml" "pkg/pkg.ml" "test" ]
+]
+
+depends: [
+  "ocamlbuild" { build }
+  "ocamlfind"  { build }
+  "topkg"      { build }
+  "odoc"       { build & doc }
+  "alcotest"   { test & >= "0.8.0" & < "0.9.0" }
+  "bencode"    { >= "1.0.2" } # actually need to pin master to get this working
+  "fmt"        { >= "0.8.4" & < "0.9.0" }
+  "logs"       { >= "0.6.2" & < "0.7.0" }
+  "rresult"    { >= "0.5.0" & < "0.6.0" }
+  "digestif"   { >= "0.5.0" & < "0.6.0" }
+  "cmdliner"   { >= "1.0.2" & < "1.1.0" }
+  "bos"        { >= "0.2.0" & < "0.3.0" }
+  "fpath"      { >= "0.7.2" & < "0.8.0" }
+]

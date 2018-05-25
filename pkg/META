@@ -1,0 +1,8 @@
+description = "Omgtorrent torrent creation library"
+version = "%%VERSION_NUM%%"
+requires = "bencode bos cmdliner digestif fmt fpath logs rresult"
+archive(byte) = "omgtorrent.cma"
+plugin(byte) = "omgtorrent.cma"
+archive(native) = "omgtorrent.cmxa"
+plugin(native) = "omgtorrent.cxms"
+exists_if = "omgtorrent.cma"
