@@ -1,6 +1,6 @@
 env:
   global:
-    - PINS="https://github.com/cfcs/bencode.git#prettier_pp"
+    - PINS="bencode:https://github.com/cfcs/bencode.git#prettier_pp"
     - PACKAGE="omktorrent"
     - OPAM_VERSION=1.2.2
   matrix:
