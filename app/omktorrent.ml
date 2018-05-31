@@ -85,7 +85,7 @@ let handle_file ~unaligned ~piece_length ~pieces_chan
   else
     Ok (mmap_piece_count, file_size)
 
-let fold_files ~root acc f input
+let fold_files ~root ~ignore_regex acc f input
   : ('acc, [> R.msg]) result =
   Bos.OS.Path.fold
     (* TODO consider ~dotfiles arg*)
@@ -98,18 +98,27 @@ let fold_files ~root acc f input
          Ok acc
        else
          match Fpath.relativize ~root fpath with
-         | Some rel_path ->
+         | Some rel_fpath ->
            (* let's open it in read-WRITE mode. we don't need to write,
               obviously, but the OCaml way(tm) is to live life dangerously!
               FML...
            *)
-           Logs.debug (fun m -> m "Adding file %s to torrent [%d/%d/%Ld]" path
-                          files pieces bytes ) ;
-           ( let fd = Unix.openfile path Unix.[O_RDWR] 0 in
-             let res = f rel_path fd in
-             Unix.close fd ;
-             res ) >>= fun (new_pieces, added_size) ->
-           Ok (files + 1, pieces+new_pieces, Int64.add bytes added_size)
+           let ignore_this_file =
+             Re.execp ignore_regex (Fpath.to_string rel_fpath) in
+           Logs.debug (fun m -> m "processing path: %a" Fpath.pp rel_fpath);
+
+           if ignore_this_file then begin
+             Logs.info (fun m -> m "Ignoring %a" Fpath.pp rel_fpath) ;
+             Ok acc
+           end else begin
+             Logs.debug (fun m -> m "Adding file %s to torrent [%d/%d/%Ld]" path
+                            files pieces bytes ) ;
+             ( let fd = Unix.openfile path Unix.[O_RDWR] 0 in
+               let res = f rel_fpath fd in
+               Unix.close fd ;
+               res ) >>= fun (new_pieces, added_size) ->
+             Ok (files + 1, pieces+new_pieces, Int64.add bytes added_size)
+           end
          | None ->
            Logs.err (fun m -> m "failed to relative for %s" path);
            Ok acc
@@ -119,17 +128,13 @@ let fold_files ~root acc f input
 
 let file_insertion_points output_path section_count =
   let one_terabyte = Int64.(mul 1024L (mul 1024L (mul 1024L 1024L))) in
-  (* preallocate 1TB of sparse space per worker in output file: *)
-  (*let count_64 = Int64.of_int section_count in*)
-  (*let () = Unix.LargeFile.ftruncate parent_fd
-      Int64.(mul one_terabyte count_64)
-    in*)
   (* prepare an fd for each section: *)
   Array.init section_count
     (fun idx ->
        let my_fd =
            Unix.openfile output_path
              Unix.[ O_RDWR ] 0o600  in
+       (* preallocate 1TB of sparse space per worker in output file: *)
        let my_offset = Int64.(mul one_terabyte @@ of_int idx) in
        assert ( my_offset =
                 Unix.LargeFile.lseek my_fd my_offset Unix.SEEK_SET ) ;
@@ -156,7 +161,7 @@ let collapse_insertion_points
       Int64.add acc (get_section_len fd |> snd)) 0L fds in
 
   (* buffer for keeping chunks of the sections to be rewritten: *)
-  let bufsize = 32768 in
+  let bufsize = 65536 in
   let bufsize_L = Int64.of_int bufsize in
   let buf = Bytes.make bufsize '\000' in
 
@@ -206,6 +211,7 @@ let do_make () (*<-- unit: setup_log *)
     (unaligned:bool)
     (piece_length:int)
     (output_path:string)
+    (ignore_regex:Re.re)
     (display_name:string option)
     (input_path:string) = (* TODO Fpath.t ???*)
   let output_fd = (* create output file: *)
@@ -280,7 +286,7 @@ let do_make () (*<-- unit: setup_log *)
     then input_fpath
     else Fpath.parent input_fpath in
   Logs.debug (fun m -> m "got FDs");
-  fold_files ~root (0,0,0L)
+  fold_files ~root ~ignore_regex (0,0,0L)
     (handle_file ~unaligned ~piece_length
        ~pieces_chan:(pieces_fds.(0)) (* TODO threads *)
        ~files_chan:(files_fds.(0))   (* TODO threads*)
@@ -357,27 +363,31 @@ open Cmdliner
 
 let arg_torrent =
   Arg.(required & pos 0 (some string) None
-       & info [] ~docv:"TORRENT")
+       & info [] ~docv:"TORRENT-FILE")
 
 let arg_display_name =
   (*Arg.(non_empty & pos_right 0 file [] & info [] ~docv:"FILES")*)
+  let doc =
+    {|Directory name suggested to torrent clients downloading this torrent.|} in
   Arg.(value & (opt (some string)) None
-         & info ["name"] ~docv:"DISPLAY-NAME")
+         & info ["name"] ~doc ~docv:"DISPLAY-NAME")
 
 let arg_input_path =
   (*Arg.(non_empty & pos_right 0 file [] & info [] ~docv:"FILES")*)
-  Arg.(required & pos 1 (some string) None
-         & info [] ~docv:"INPUT")
+  Arg.(required & pos 1 (some dir) None
+         & info [] ~docv:"INPUT-DIRECTORY")
 
 let arg_piece_length : int Cmdliner.Term.t =
   let default_length = "2M" in
   let doc =
     {|Manually supply a piece length for the torrent to be created.
-      The default length is |} ^ default_length ^
-    {| and care should be taken when changing it:
+      The parsers accepts lengths in the formats $(b,[0-9]+),
+      $(b,[0-9]+K), and $(b,[0-9]+M) for bytes, KiB, and MiB respectively.
+
+      Care should be taken when changing the default:
       If you are looking to take advantage of piece deduplication across
-      torrents, make sure they have the same piece length in addition to
-       using file-aligned padding.|}
+      overlapping torrents, make sure they have the same piece length in
+      addition to using file-aligned padding.|}
   in
   let length_parser : int Cmdliner.Arg.parser =
     fun length ->
@@ -395,27 +405,48 @@ let arg_piece_length : int Cmdliner.Term.t =
       |> R.reword_error (fun (`Msg str) -> str)
       |> R.to_presult
   in
-  Arg.(value & opt (length_parser, (fun fmt _ -> Format.fprintf fmt "LENGTH"))
+  Arg.(value & opt (length_parser,
+                    (fun fmt _def -> Format.pp_print_string fmt default_length))
          (match length_parser default_length with
           | `Ok default -> default
           | `Error err -> failwith @@ "default length is invalid: " ^ err)
        & info ["piece-length"] ~doc)
 
+let arg_ignore =
+  let doc = {|Ignore files or foldes matching this regular expression.
+              The matching is done PCRE-style and is case-sensitive.
+              It is applied to the relative path preceding $(b,INPUT-DIRECTORY).
+              This parameter may be passed multiple times.
+              Example: Ignore everything under $(i,src/test/)
+              and all files ending in $(i,.o):
+              $(mname) $(tname)
+              $(b,--ignore) $(i,'^test/') $(b,--ignore) $(i,'\\.o\$')
+              $(i,src.torrent src/)
+            |}in
+  let regex_list =
+    Arg.(opt_all ((fun x -> ( Rresult.R.trap_exn
+                                (Re.Perl.re ~opts:[`Dotall; `Multiline]) x)
+                            |> Rresult.R.error_exn_trap_to_msg
+                            |> R.reword_error (fun (`Msg str) -> str)
+                            |> Rresult.R.to_presult
+                  ), Re.pp ) []
+        ) in
+  Term.(const (fun lst -> Re.alt lst |> Re.compile) $
+        Arg.(value & regex_list & info ["ignore"] ~doc))
 
 let arg_unaligned =
   let doc =
-    {|By default $(mname) inserts padding files after files that
+    "NB: This flag is ignored in this version of the codebase.\n" ^
+    {|By default $(tname) inserts padding files after files that
       do not fit \(align\) perfectly with the piece length.
       This enables deduplication within v1 torrents, and enables DHT peers that
       possess identical files from overlapping torrents to seed the files in
       your newly produced torrent, but does result in a slightly larger torrent
-      file \(roughly TODO ~}
-      ^ string_of_int ( 50 (* "4:attr" + "1:p" *) )^
-    {|50 bytes per file\).
+      file \(roughly ~50 bytes per file\).
       Clients implementing BEP-0047 ignore these padding files, and they only
-      incur minor metadata overhead \(no extra bandwidth is spent transferring
-      their null content\).
-      Passing this flag to $(mname) makes it refrain from inserting this
+      incur minor metadata overhead \(no extra bandwidth is used transferring
+      their null contents\).
+      Passing this flag to $(tname) causes it to refrain from inserting this
       padding, and is useful if your dataset contains millions of unique files
       that are not individually useful and thus unlikely to be shared in another
       torrent.
@@ -438,19 +469,19 @@ let cmdliner_info =
     ~sdocs:Manpage.s_common_options (* put --help and --version under that *)
 
 let make_cmd =
-  let doc = {| $(mname) is a commandline interface to the omgtorrent
-               library. |} in
+  let doc = {|Make a new torrent file|} in
   let man = [] in
   Term.(term_result (const do_make $ setup_log
                      $ arg_unaligned
                      $ arg_piece_length
                      $ arg_torrent
+                     $ arg_ignore
                      $ arg_display_name
                      $ arg_input_path)),
   cmdliner_info "make" ~man ~doc
 
 let pp_cmd =
-  let doc = {| pretty-prints a torrent file|} in
+  let doc = {|Pretty-print a torrent file in human-readable form.|} in
   let man = [] in
   Term.(term_result (const do_pp $ setup_log
                      $ arg_torrent)),
@@ -461,44 +492,40 @@ let add_tracker_cmd =
   ()
 
 let help_cmd =
-  let doc = {| $(mname)HELP is a commandline interface to the omgtorrent
-               library. |} in
+  let doc = {|Print usage instructions.|} in
   let man =
 [
   `S "DESCRIPTION" ;
   `P {|$(mname) implements BEP-003 (BitTorrent v1) for the purpose of creating
        torrent files by indexing a set of directories.|} ;
   `S "USAGE" ;
-  `P {|Note that you only have to type out a unique prefix for the subcommands.
-       That means that $(mname) $(b,l) is an alias for
-       $(mname) $(b,list-packets) ;
-       That $(mname) $(b,v) is an alias for $(mname) $(b,verify) and so forth.|}
- ;`P {|The same is the case for options,
-       so $(b,--rng) is an alias for $(b,--rng-seed) ;|} ;
-  `Noblank ;
-  `P {|$(mname) $(b,v) $(b,--sig) $(i,file.asc) is equivalent to
-       $(mname) $(b,verify) $(b,--signature) $(i,file.asc) |} ;
-  `S "EXAMPLES" ;
-  `P "# $(mname) $(b,genkey --uid) 'Abbot Hoffman' $(b,>) abbie.priv" ;
-  `P "# $(mname) $(b,sign --sk) abbie.priv MKULTRA.DOC $(b,>) MKULTRA.DOC.asc" ;
-  `P "# $(mname) $(b,convert) abbie.priv $(b,>) abbie.pub" ;
-  `P {|# $(mname) $(b,verify --sig) MKULTRA.DOC.asc $(b,--pk) abbie.pub
-                   MKULTRA.DOC |} ; `Noblank ;
-  `Pre {|opgp: [ERROR] Failed decoding ASCII armor ASCII public key block,
-              parsing as raw instead|} ; `Noblank ;
-  `P "Good signature!" ;
-  `P {|# $(b,echo \$?) |}; `Noblank ;
-  `P "0" ;
+  `P {|useful usage instructions TODO |}
+    ;
   `S Manpage.s_bugs;
   `P ( "Please report bugs on the issue tracker at "
-     ^ "<https://github.com/cfcs/omgtorrent/issues>") ]
+     ^ "<https://github.com/cfcs/omktorrent/issues>") ]
   in
   let help _ = `Help (`Pager, None) in
   Term.(ret (const help $ setup_log)),
   cmdliner_info "help" ~man ~doc
 
+let default_cmd =
+  let doc = "A tool for creating BitTorrent files." in
+  let man =
+    [ `P {||} ;
+      `P {|There are several subcommands at your disposal.
+           The shortest unique prefix can be used, for example
+           $(mname) $(b,m) to call $(mname) $(b,make)|} ;
+      `P {|The following RFCs are at least partially implemented:
+           - $(b,BEP-0003)
+           - $(b,BEP-0013)
+         |}
+    ] in
+  let help _ = `Help (`Pager, None) in
+  Term.(ret (const help $ setup_log)),
+  cmdliner_info "omktorrent" ~man ~doc
 
-let cmds = [ help_cmd ; make_cmd ; pp_cmd ]
+let cmds = [ make_cmd ; pp_cmd ; help_cmd ]
 
 let () =
-  Term.(exit @@ eval_choice help_cmd cmds)
+  Term.(exit @@ eval_choice default_cmd cmds)

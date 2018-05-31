@@ -10,5 +10,7 @@ more files you have (like other torrent creation tools do).
 File-aligned padding is supported, and the default. `--unaligned` is not properly implemented yet.
 
 RFCs:
-- BEP-0003: BitTorrent v1
-- TODO
+- [BEP-0003: BitTorrent v1](http://bittorrent.org/beps/bep_0003.html)
+- [BEP-0013: `announce-list`](http://bittorrent.org/beps/bep_0012.html)
+- [BEP-0027: Private torrents](http://bittorrent.org/beps/bep_0027.html)
+- [BEP-0047: Padding files and extended file attributes](http://bittorrent.org/beps/bep_0047.html)
